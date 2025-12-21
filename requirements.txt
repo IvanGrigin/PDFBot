@@ -1,0 +1,4 @@
+aiogram==3.*
+pillow
+pypdf
+pillow-heif; platform_system != "Windows"
