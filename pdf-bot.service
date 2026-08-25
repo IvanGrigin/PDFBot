@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram bot: Best PDF Robot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivan
+WorkingDirectory=/home/ivan/pdf-bot
+EnvironmentFile=/home/ivan/pdf-bot/.env
+ExecStart=/home/ivan/pdf-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ivan/pdf-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import shutil
 import zipfile
 import tempfile
 from dataclasses import dataclass
@@ -7,15 +9,17 @@ from typing import List, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
+    BotCommand,
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 
-from PIL import Image
+from dotenv import load_dotenv
+from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter
 
 # --- Optional HEIC/HEIF support ---
@@ -28,17 +32,21 @@ except Exception:
     HEIF_ENABLED = False
 
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(ROOT, ".env"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Set BOT_TOKEN env var, e.g. export BOT_TOKEN='...'")
 
 router = Router()
 
 # ====== SETTINGS ======
 MAX_PHOTOS = 15
-MAX_PDF_DOWNLOAD_MB = 20  # standard Bot API download limit via getFile (practical restriction)
+MAX_PDF_DOWNLOAD_MB = int(os.getenv("MAX_PDF_DOWNLOAD_MB", "20"))
 MAX_PDF_DOWNLOAD_BYTES = MAX_PDF_DOWNLOAD_MB * 1024 * 1024
 SPLIT_SEPARATE_MAX_PAGES = 30
+MIN_FREE_BYTES = int(os.getenv("MIN_FREE_GB", "5")) * 1024**3
+MAX_OUTPUT_BYTES = 49 * 1024 * 1024
+PAGE_PORTRAIT = (1240, 1754)
+PAGE_MARGIN = 56
 
 ALLOWED_IMAGE_EXT = {
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".heic", ".heif"
@@ -47,27 +55,27 @@ ALLOWED_IMAGE_EXT = {
 # ====== UI ======
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Make PDF", callback_data="menu_makepdf")],
-        [InlineKeyboardButton(text="Rename PDF", callback_data="menu_renamepdf")],
-        [InlineKeyboardButton(text="Split PDF", callback_data="menu_splitpdf")],
+        [InlineKeyboardButton(text="🖼 Создать PDF", callback_data="menu_makepdf")],
+        [InlineKeyboardButton(text="✏️ Переименовать PDF", callback_data="menu_renamepdf")],
+        [InlineKeyboardButton(text="✂️ Разделить PDF", callback_data="menu_splitpdf")],
     ])
 
 def makepdf_controls_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="No more photos → Create PDF", callback_data="makepdf_done")],
-        [InlineKeyboardButton(text="Cancel", callback_data="cancel")],
+        [InlineKeyboardButton(text="✅ Фото больше нет — создать PDF", callback_data="makepdf_done")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
     ])
 
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Cancel", callback_data="cancel")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
 def split_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ZIP (all pages)", callback_data="split_zip")],
-        [InlineKeyboardButton(text="Separate PDFs (≤30 pages)", callback_data="split_sep")],
-        [InlineKeyboardButton(text="Cancel", callback_data="cancel")],
+        [InlineKeyboardButton(text="🗜 ZIP со всеми страницами", callback_data="split_zip")],
+        [InlineKeyboardButton(text="📄 Отдельные PDF — до 30 страниц", callback_data="split_sep")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
     ])
 
 # ====== FSM ======
@@ -103,22 +111,39 @@ async def _download_telegram_file(bot: Bot, file_id: str) -> bytes:
     await bot.download_file(f.file_path, destination=bio)
     return bio.getvalue()
 
+def _image_to_page(image: Image.Image) -> Image.Image:
+    """Вписать изображение в страницу без обрезки и с учётом EXIF-поворота."""
+    oriented = ImageOps.exif_transpose(image)
+    page_size = PAGE_PORTRAIT if oriented.height >= oriented.width else PAGE_PORTRAIT[::-1]
+    content_size = (page_size[0] - 2 * PAGE_MARGIN, page_size[1] - 2 * PAGE_MARGIN)
+    fitted = ImageOps.contain(oriented.convert("RGB"), content_size, Image.Resampling.LANCZOS)
+    page = Image.new("RGB", page_size, "white")
+    page.paste(fitted, ((page.width - fitted.width) // 2, (page.height - fitted.height) // 2))
+    return page
+
+
 def _images_to_pdf_bytes(images: List[Image.Image]) -> bytes:
-    rgb = []
-    for im in images:
-        if im.mode in ("RGBA", "P"):
-            im = im.convert("RGB")
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-        rgb.append(im)
+    rgb = [_image_to_page(image) for image in images]
 
     if not rgb:
         raise ValueError("No images")
 
     out = io.BytesIO()
     first, rest = rgb[0], rgb[1:]
-    first.save(out, format="PDF", save_all=True, append_images=rest)
+    first.save(out, format="PDF", save_all=True, append_images=rest, resolution=150)
+    for page in rgb:
+        page.close()
     return out.getvalue()
+
+
+def _safe_pdf_name(value: str, fallback: str = "document") -> str:
+    name = re.sub(r"\.pdf$", "", value.strip(), flags=re.IGNORECASE)
+    name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name)
+    return name[:100].strip(" ._") or fallback
+
+
+def _enough_disk() -> bool:
+    return shutil.disk_usage(ROOT).free >= MIN_FREE_BYTES
 
 def _is_image_document(message: Message) -> bool:
     doc = message.document
@@ -146,16 +171,19 @@ async def _show_menu_edit(call: CallbackQuery, text: str = "Выберите д�
 
 # ====== Common ======
 @router.message(CommandStart())
+@router.message(Command("help"))
 async def start(message: Message, state: FSMContext):
     await state.clear()
     heic_note = "" if HEIF_ENABLED else "\nHEIC/HEIF: для поддержки установите pillow-heif."
     await message.answer(
-        "Меню операций:\n"
-        "• Make PDF (до 15 изображений)\n"
-        "• Rename PDF (PDF до ~20MB)\n"
-        "• Split PDF (PDF до ~20MB)\n"
+        "📄 <b>Best PDF Robot</b>\n\n"
+        "Создавайте PDF из фотографий без обрезки, переименовывайте файлы "
+        "и разделяйте документы на отдельные страницы.\n\n"
+        "• До 15 изображений в одном PDF\n"
+        f"• Обработка PDF до {MAX_PDF_DOWNLOAD_MB} МБ\n"
+        "• Временные файлы удаляются после отправки\n"
         f"{heic_note}",
-        reply_markup=main_menu_kb()
+        reply_markup=main_menu_kb(), parse_mode="HTML"
     )
 
 @router.callback_query(F.data == "cancel")
@@ -183,7 +211,7 @@ async def menu_renamepdf(call: CallbackQuery, state: FSMContext):
     await state.update_data(sess=_new_session().__dict__)
     await call.message.answer(
         "Пришлите PDF-файл для переименования.\n"
-        f"Ограничение: бот сможет скачать и обработать файл до ~{MAX_PDF_DOWNLOAD_MB}MB.",
+        f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
         reply_markup=cancel_kb()
     )
 
@@ -194,7 +222,7 @@ async def menu_splitpdf(call: CallbackQuery, state: FSMContext):
     await state.update_data(sess=_new_session().__dict__)
     await call.message.answer(
         "Пришлите PDF-файл для разделения.\n"
-        f"Ограничение: бот сможет скачать и обработать файл до ~{MAX_PDF_DOWNLOAD_MB}MB.",
+        f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
         reply_markup=cancel_kb()
     )
 
@@ -206,7 +234,7 @@ async def makepdf_collect_photo(message: Message, state: FSMContext):
 
     if len(sess.image_file_ids) >= MAX_PHOTOS:
         await message.answer(
-            f"Достигнут лимит {MAX_PHOTOS} изображений. Нажмите “No more photos → Create PDF”.",
+            f"Достигнут лимит {MAX_PHOTOS} изображений. Нажмите «Фото больше нет — создать PDF».",
             reply_markup=makepdf_controls_kb()
         )
         return
@@ -224,7 +252,7 @@ async def makepdf_collect_photo(message: Message, state: FSMContext):
 async def makepdf_collect_document_image(message: Message, state: FSMContext):
     if not _is_image_document(message):
         await message.answer(
-            "Это документ, но не похоже на изображение. Пришлите картинку или нажмите Create PDF.",
+            "Это не похоже на изображение. Пришлите картинку или нажмите «Фото больше нет — создать PDF».",
             reply_markup=makepdf_controls_kb()
         )
         return
@@ -234,7 +262,7 @@ async def makepdf_collect_document_image(message: Message, state: FSMContext):
 
     if len(sess.image_file_ids) >= MAX_PHOTOS:
         await message.answer(
-            f"Достигнут лимит {MAX_PHOTOS} изображений. Нажмите “No more photos → Create PDF”.",
+            f"Достигнут лимит {MAX_PHOTOS} изображений. Нажмите «Фото больше нет — создать PDF».",
             reply_markup=makepdf_controls_kb()
         )
         return
@@ -267,7 +295,7 @@ async def makepdf_done(call: CallbackQuery, state: FSMContext):
 
 @router.message(Flow.makepdf_ask_name, F.text)
 async def makepdf_create_and_send(message: Message, state: FSMContext, bot: Bot):
-    filename = (message.text or "").strip()
+    filename = _safe_pdf_name(message.text or "", "")
     if not filename:
         await message.answer("Название не должно быть пустым. Введите ещё раз.", reply_markup=cancel_kb())
         return
@@ -275,15 +303,20 @@ async def makepdf_create_and_send(message: Message, state: FSMContext, bot: Bot)
     data = await state.get_data()
     sess = SessionData(**data["sess"])
 
-    await message.answer("Собираю PDF…")
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
+        return
+    await message.answer("⏳ Собираю PDF без обрезки изображений…")
 
     images: List[Image.Image] = []
     try:
         for fid in sess.image_file_ids:
             raw = await _download_telegram_file(bot, fid)
             try:
-                im = Image.open(io.BytesIO(raw))
-                images.append(im)
+                with Image.open(io.BytesIO(raw)) as im:
+                    im.load()
+                    images.append(im.copy())
             except Exception:
                 # likely unsupported format (e.g. HEIC without plugin) or corrupted file
                 if not HEIF_ENABLED:
@@ -302,6 +335,8 @@ async def makepdf_create_and_send(message: Message, state: FSMContext, bot: Bot)
                 return
 
         pdf_bytes = _images_to_pdf_bytes(images)
+        if len(pdf_bytes) > MAX_OUTPUT_BYTES:
+            raise ValueError("result too large")
     except Exception:
         await message.answer(
             "Ошибка при создании PDF. Проверьте, что изображения корректные и попробуйте снова.",
@@ -341,8 +376,8 @@ async def rename_receive_pdf(message: Message, state: FSMContext):
 
     if _pdf_too_large(doc.file_size):
         await message.answer(
-            f"Файл слишком большой ({doc.file_size / (1024*1024):.1f}MB).\n"
-            f"Через стандартный Bot API бот не сможет скачать и обработать PDF больше ~{MAX_PDF_DOWNLOAD_MB}MB.\n"
+            f"Файл слишком большой ({doc.file_size / (1024*1024):.1f} МБ).\n"
+            f"Через стандартный Bot API бот обрабатывает PDF до {MAX_PDF_DOWNLOAD_MB} МБ.\n"
             "Сожмите PDF или используйте меньший файл.",
             reply_markup=main_menu_kb()
         )
@@ -360,9 +395,13 @@ async def rename_receive_pdf(message: Message, state: FSMContext):
 
 @router.message(Flow.rename_ask_name, F.text)
 async def rename_send(message: Message, state: FSMContext, bot: Bot):
-    new_name = (message.text or "").strip()
+    new_name = _safe_pdf_name(message.text or "", "")
     if not new_name:
         await message.answer("Имя не должно быть пустым. Введите ещё раз.", reply_markup=cancel_kb())
+        return
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
         return
 
     data = await state.get_data()
@@ -402,11 +441,15 @@ async def split_receive_pdf(message: Message, state: FSMContext, bot: Bot):
     if not name.endswith(".pdf"):
         await message.answer("Это не PDF. Пришлите файл .pdf", reply_markup=cancel_kb())
         return
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
+        return
 
     if _pdf_too_large(doc.file_size):
         await message.answer(
-            f"Файл слишком большой ({doc.file_size / (1024*1024):.1f}MB).\n"
-            f"Через стандартный Bot API бот не сможет скачать и обработать PDF больше ~{MAX_PDF_DOWNLOAD_MB}MB.\n"
+            f"Файл слишком большой ({doc.file_size / (1024*1024):.1f} МБ).\n"
+            f"Через стандартный Bot API бот обрабатывает PDF до {MAX_PDF_DOWNLOAD_MB} МБ.\n"
             "Сожмите PDF или используйте меньший файл.",
             reply_markup=main_menu_kb()
         )
@@ -462,9 +505,8 @@ async def split_do(call: CallbackQuery, state: FSMContext):
 
     if mode == "split_sep" and n > SPLIT_SEPARATE_MAX_PAGES:
         await call.message.answer(
-            f"В PDF {n} страниц. В режиме Separate бот отправляет максимум {SPLIT_SEPARATE_MAX_PAGES}, "
-            "чтобы не заспамить чат.\n"
-            "Выберите ZIP.",
+            f"В PDF {n} страниц. Отдельно бот отправляет максимум {SPLIT_SEPARATE_MAX_PAGES}, "
+            "чтобы не заспамить чат. Выберите ZIP.",
             reply_markup=split_mode_kb()
         )
         return
@@ -529,7 +571,7 @@ async def split_do(call: CallbackQuery, state: FSMContext):
 async def makepdf_other(message: Message):
     await message.answer(
         "Пожалуйста, отправьте изображение (photo) или картинку как документ.\n"
-        "Либо нажмите “No more photos → Create PDF”.",
+        "Либо нажмите «Фото больше нет — создать PDF».",
         reply_markup=makepdf_controls_kb()
     )
 
@@ -542,7 +584,18 @@ async def split_other(message: Message):
     await message.answer("Жду PDF-документ.", reply_markup=cancel_kb())
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Заполните BOT_TOKEN в .env")
     bot = Bot(BOT_TOKEN)
+    await bot.set_my_name("Best PDF Robot")
+    await bot.set_my_short_description(
+        "Создание PDF из фото, переименование и разделение документов.")
+    await bot.set_my_description(
+        "Создаёт PDF из фотографий без обрезки, переименовывает PDF и разделяет страницы.")
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Открыть главное меню"),
+        BotCommand(command="help", description="Показать возможности бота"),
+    ])
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)

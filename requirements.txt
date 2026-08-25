@@ -1,4 +1,5 @@
 aiogram==3.*
+python-dotenv
 pillow
 pypdf
 pillow-heif; platform_system != "Windows"
