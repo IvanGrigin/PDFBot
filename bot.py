@@ -1,7 +1,9 @@
+import asyncio
 import os
 import io
 import re
 import shutil
+import subprocess
 import zipfile
 import tempfile
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ MAX_PDF_DOWNLOAD_BYTES = MAX_PDF_DOWNLOAD_MB * 1024 * 1024
 SPLIT_SEPARATE_MAX_PAGES = 30
 MIN_FREE_BYTES = int(os.getenv("MIN_FREE_GB", "5")) * 1024**3
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
+PDF_COMPRESS_TIMEOUT_SECONDS = int(os.getenv("PDF_COMPRESS_TIMEOUT_SECONDS", "180"))
 PAGE_PORTRAIT = (1240, 1754)
 PAGE_MARGIN = 56
 
@@ -56,6 +59,7 @@ ALLOWED_IMAGE_EXT = {
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🖼 Создать PDF", callback_data="menu_makepdf")],
+        [InlineKeyboardButton(text="🗜 Сжать PDF", callback_data="menu_compresspdf")],
         [InlineKeyboardButton(text="✏️ Переименовать PDF", callback_data="menu_renamepdf")],
         [InlineKeyboardButton(text="✂️ Разделить PDF", callback_data="menu_splitpdf")],
     ])
@@ -88,6 +92,8 @@ class Flow(StatesGroup):
 
     split_wait_pdf = State()
     split_choose_mode = State()
+
+    compress_wait_pdf = State()
 
 @dataclass
 class SessionData:
@@ -142,6 +148,49 @@ def _safe_pdf_name(value: str, fallback: str = "document") -> str:
     return name[:100].strip(" ._") or fallback
 
 
+def _compressed_pdf_name(original_filename: str | None) -> str:
+    """Добавить запрошенный суффикс без удвоения расширения PDF."""
+    stem = _safe_pdf_name(original_filename or "document", "document")
+    if not stem.casefold().endswith("_compresed"):
+        stem += "_compresed"
+    return f"{stem}.pdf"
+
+
+def _compress_pdf_file(source: str, target: str) -> None:
+    """Сжать PDF через Ghostscript без shell и проверить созданный файл."""
+    executable = shutil.which("gs")
+    if not executable:
+        raise RuntimeError("Ghostscript is not installed")
+    command = [
+        executable,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.6",
+        "-dPDFSETTINGS=/ebook",
+        "-dNOPAUSE",
+        "-dBATCH",
+        "-dQUIET",
+        "-dSAFER",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+        "-dDownsampleColorImages=true",
+        "-dColorImageResolution=144",
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageResolution=144",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageResolution=300",
+        f"-sOutputFile={target}",
+        source,
+    ]
+    subprocess.run(
+        command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=PDF_COMPRESS_TIMEOUT_SECONDS,
+    )
+    if not os.path.isfile(target) or os.path.getsize(target) == 0:
+        raise RuntimeError("Ghostscript created an empty file")
+    PdfReader(target)
+
+
 def _enough_disk() -> bool:
     return shutil.disk_usage(ROOT).free >= MIN_FREE_BYTES
 
@@ -178,7 +227,7 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "📄 <b>Best PDF Robot</b>\n\n"
         "Создавайте PDF из фотографий без обрезки, переименовывайте файлы "
-        "и разделяйте документы на отдельные страницы.\n\n"
+        "сжимайте и разделяйте документы на отдельные страницы.\n\n"
         "• До 15 изображений в одном PDF\n"
         f"• Обработка PDF до {MAX_PDF_DOWNLOAD_MB} МБ\n"
         "• Временные файлы удаляются после отправки\n"
@@ -213,6 +262,18 @@ async def menu_renamepdf(call: CallbackQuery, state: FSMContext):
         "Пришлите PDF-файл для переименования.\n"
         f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
         reply_markup=cancel_kb()
+    )
+
+
+@router.callback_query(F.data == "menu_compresspdf")
+async def menu_compresspdf(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(Flow.compress_wait_pdf)
+    await state.update_data(sess=_new_session().__dict__)
+    await call.message.answer(
+        "Пришлите PDF для сжатия. Изображения будут оптимизированы для просмотра на экране.\n"
+        f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
+        reply_markup=cancel_kb(),
     )
 
 @router.callback_query(F.data == "menu_splitpdf")
@@ -392,6 +453,64 @@ async def rename_receive_pdf(message: Message, state: FSMContext):
 
     await state.set_state(Flow.rename_ask_name)
     await message.answer("Напишите новое имя (без .pdf).", reply_markup=cancel_kb())
+
+
+# ====== COMPRESS PDF ======
+@router.message(Flow.compress_wait_pdf, F.document)
+async def compress_receive_pdf(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not name.endswith(".pdf"):
+        await message.answer("Это не PDF. Пришлите файл .pdf", reply_markup=cancel_kb())
+        return
+    if _pdf_too_large(doc.file_size):
+        await message.answer(
+            f"Файл слишком большой ({(doc.file_size or 0) / (1024*1024):.1f} МБ).\n"
+            f"Сейчас бот обрабатывает PDF до {MAX_PDF_DOWNLOAD_MB} МБ.",
+            reply_markup=main_menu_kb(),
+        )
+        await state.clear()
+        return
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
+        return
+
+    await message.answer("⏳ Скачиваю и сжимаю PDF…")
+    try:
+        raw = await _download_telegram_file(bot, doc.file_id)
+        with tempfile.TemporaryDirectory(prefix="pdf-compress-") as temp_dir:
+            source = os.path.join(temp_dir, "source.pdf")
+            compressed = os.path.join(temp_dir, "compressed.pdf")
+            with open(source, "wb") as stream:
+                stream.write(raw)
+            await asyncio.to_thread(_compress_pdf_file, source, compressed)
+            result = compressed if os.path.getsize(compressed) < len(raw) else source
+            result_size = os.path.getsize(result)
+            if result_size > MAX_OUTPUT_BYTES:
+                raise ValueError("result too large")
+            await message.answer_document(
+                FSInputFile(result, filename=_compressed_pdf_name(doc.file_name))
+            )
+        saved = max(0, len(raw) - result_size)
+        if saved:
+            percent = saved * 100 / len(raw)
+            status = f"Готово: файл уменьшен на {percent:.0f}%."
+        else:
+            status = "Готово. Этот PDF уже был хорошо оптимизирован, поэтому меньшей версии не получилось."
+        await _show_menu(message, status)
+    except subprocess.TimeoutExpired:
+        await message.answer(
+            "Сжатие заняло слишком много времени. Попробуйте PDF меньшего размера.",
+            reply_markup=main_menu_kb(),
+        )
+    except Exception:
+        await message.answer(
+            "Не удалось сжать PDF. Возможно, файл повреждён или защищён паролем.",
+            reply_markup=main_menu_kb(),
+        )
+    finally:
+        await state.clear()
 
 @router.message(Flow.rename_ask_name, F.text)
 async def rename_send(message: Message, state: FSMContext, bot: Bot):
@@ -583,15 +702,20 @@ async def rename_other(message: Message):
 async def split_other(message: Message):
     await message.answer("Жду PDF-документ.", reply_markup=cancel_kb())
 
+
+@router.message(Flow.compress_wait_pdf)
+async def compress_other(message: Message):
+    await message.answer("Жду PDF-документ.", reply_markup=cancel_kb())
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Заполните BOT_TOKEN в .env")
     bot = Bot(BOT_TOKEN)
     await bot.set_my_name("Best PDF Robot")
     await bot.set_my_short_description(
-        "Создание PDF из фото, переименование и разделение документов.")
+        "Создание и сжатие PDF, переименование и разделение документов.")
     await bot.set_my_description(
-        "Создаёт PDF из фотографий без обрезки, переименовывает PDF и разделяет страницы.")
+        "Создаёт PDF из фотографий без обрезки, сжимает, переименовывает и разделяет документы.")
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть главное меню"),
         BotCommand(command="help", description="Показать возможности бота"),
@@ -601,5 +725,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

@@ -1,8 +1,9 @@
 # Best PDF Robot
 
-Telegram-бот для трёх операций:
+Telegram-бот для четырёх операций:
 
 - создание PDF из 1-15 фотографий без обрезки;
+- сжатие PDF с окончанием имени `_compresed.pdf`;
 - переименование PDF;
 - разделение PDF на отдельные файлы или ZIP.
 
@@ -12,6 +13,7 @@ Telegram-бот для трёх операций:
 ## Запуск
 
 ```bash
+sudo apt-get install ghostscript
 cp .env.example .env
 nano .env
 python3 -m venv .venv

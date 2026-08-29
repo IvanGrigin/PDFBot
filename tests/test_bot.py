@@ -32,9 +32,16 @@ class PdfBotTest(unittest.TestCase):
         self.assertEqual(bot._safe_pdf_name("  report.pdf  "), "report")
         self.assertEqual(bot._safe_pdf_name('../bad:name?.pdf'), "bad_name")
 
-    def test_menu_contains_all_three_operations(self) -> None:
+    def test_menu_contains_all_four_operations(self) -> None:
         labels = [row[0].text for row in bot.main_menu_kb().inline_keyboard]
-        self.assertEqual(labels, ["🖼 Создать PDF", "✏️ Переименовать PDF", "✂️ Разделить PDF"])
+        self.assertEqual(labels, [
+            "🖼 Создать PDF", "🗜 Сжать PDF", "✏️ Переименовать PDF", "✂️ Разделить PDF"
+        ])
+
+    def test_compressed_filename_has_requested_suffix(self) -> None:
+        self.assertEqual(bot._compressed_pdf_name("Report.pdf"), "Report_compresed.pdf")
+        self.assertEqual(bot._compressed_pdf_name("Report_compresed.pdf"), "Report_compresed.pdf")
+        self.assertEqual(bot._compressed_pdf_name("../bad:name.PDF"), "bad_name_compresed.pdf")
 
 
 if __name__ == "__main__":
