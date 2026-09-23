@@ -14,7 +14,7 @@ from aiogram.types import (
     BotCommand,
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    FSInputFile, BufferedInputFile, InputMediaPhoto
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -48,6 +48,10 @@ SPLIT_SEPARATE_MAX_PAGES = 30
 MIN_FREE_BYTES = int(os.getenv("MIN_FREE_GB", "5")) * 1024**3
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 PDF_COMPRESS_TIMEOUT_SECONDS = int(os.getenv("PDF_COMPRESS_TIMEOUT_SECONDS", "180"))
+PDF_PREVIEW_MAX_PAGES = 30
+PDF_PREVIEW_DPI = 40
+PDF_PREVIEW_TIMEOUT_SECONDS = int(os.getenv("PDF_PREVIEW_TIMEOUT_SECONDS", "60"))
+PREVIEW_ALBUM_SIZE = 10  # лимит Telegram на фото в одном альбоме
 PAGE_PORTRAIT = (1240, 1754)
 PAGE_MARGIN = 56
 
@@ -384,6 +388,71 @@ def _crop_pdf_pages(raw: bytes, ops: List[Tuple[int, int, float, float, float, f
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue(), len(plan)
+
+
+def _render_pdf_previews(source_path: str, output_dir: str, max_pages: int) -> List[Tuple[int, bytes]]:
+    """Отрендерить первые страницы PDF в PNG-миниатюры через Ghostscript."""
+    executable = shutil.which("gs")
+    if not executable:
+        raise RuntimeError("Ghostscript is not installed")
+    prefix = os.path.join(output_dir, "page")
+    command = [
+        executable,
+        "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+        "-sDEVICE=png16m",
+        f"-r{PDF_PREVIEW_DPI}",
+        "-dFirstPage=1",
+        f"-dLastPage={max_pages}",
+        f"-sOutputFile={prefix}-%02d.png",
+        source_path,
+    ]
+    subprocess.run(
+        command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=PDF_PREVIEW_TIMEOUT_SECONDS,
+    )
+    previews: List[Tuple[int, bytes]] = []
+    for number in range(1, max_pages + 1):
+        path = f"{prefix}-{number:02d}.png"
+        if not os.path.isfile(path):
+            break
+        with open(path, "rb") as stream:
+            previews.append((number, stream.read()))
+    if not previews:
+        raise RuntimeError("Ghostscript produced no preview images")
+    return previews
+
+
+async def _send_crop_previews(message: Message, raw: bytes, page_count: int) -> str:
+    """Прислать миниатюры страниц альбомами. Возвращает примечание, если показаны не все."""
+    with tempfile.TemporaryDirectory(prefix="pdf-preview-") as temp_dir:
+        source = os.path.join(temp_dir, "source.pdf")
+        with open(source, "wb") as stream:
+            stream.write(raw)
+        previews = await asyncio.to_thread(
+            _render_pdf_previews, source, temp_dir, PDF_PREVIEW_MAX_PAGES
+        )
+
+    await message.answer(f"🖼 Предпросмотр страниц 1–{len(previews)}:")
+    for start in range(0, len(previews), PREVIEW_ALBUM_SIZE):
+        chunk = previews[start:start + PREVIEW_ALBUM_SIZE]
+        media = [
+            InputMediaPhoto(
+                media=BufferedInputFile(data, filename=f"page_{number:02d}.png"),
+                caption=(
+                    f"Страницы {start + 1}–{start + len(chunk)} из {page_count}"
+                    if index == 0 else None
+                ),
+            )
+            for index, (number, data) in enumerate(chunk)
+        ]
+        await message.answer_media_group(media)
+
+    if page_count > len(previews):
+        return (
+            f"\n\nПредпросмотр ограничен первыми {PDF_PREVIEW_MAX_PAGES} страницами "
+            f"из {page_count}."
+        )
+    return ""
 
 
 def _compress_pdf_file(source: str, target: str) -> None:
@@ -1258,9 +1327,13 @@ async def crop_receive_pdf(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(sess=sess.__dict__)
 
     await state.set_state(Flow.crop_ask_ops)
+    try:
+        preview_note = await _send_crop_previews(message, raw, page_count)
+    except Exception:
+        preview_note = "\n\n⚠️ Предпросмотр сделать не удалось — продолжаем без него."
     await message.answer(
         f"В PDF {page_count} страниц. Напишите, сколько отрезать у каждой группы страниц.\n\n"
-        f"{_crop_ops_help(page_count)}",
+        f"{_crop_ops_help(page_count)}{preview_note}",
         reply_markup=cancel_kb()
     )
 

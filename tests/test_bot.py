@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import tempfile
 import unittest
 
 from PIL import Image
@@ -145,6 +148,25 @@ class PdfBotTest(unittest.TestCase):
         self.assertAlmostEqual(float(first.height), float(original.height) * 0.9, delta=0.01)
         self.assertAlmostEqual(float(second.width), float(original.width), delta=0.01)
         self.assertAlmostEqual(float(second.height), float(original.height), delta=0.01)
+
+    @unittest.skipUnless(shutil.which("gs"), "ghostscript не установлен")
+    def test_render_pdf_previews_limits_page_count(self) -> None:
+        source = bot._images_to_pdf_bytes([
+            Image.new("RGB", (300, 900), "blue"),
+            Image.new("RGB", (900, 300), "green"),
+            Image.new("RGB", (300, 900), "red"),
+        ])
+        with tempfile.TemporaryDirectory(prefix="pdf-preview-test-") as temp_dir:
+            source_path = os.path.join(temp_dir, "source.pdf")
+            with open(source_path, "wb") as stream:
+                stream.write(source)
+
+            previews = bot._render_pdf_previews(source_path, temp_dir, 2)
+
+        self.assertEqual([number for number, _ in previews], [1, 2])
+        for _, data in previews:
+            self.assertTrue(data.startswith(b"\x89PNG"))
+            self.assertGreater(len(data), 0)
 
 
 if __name__ == "__main__":
