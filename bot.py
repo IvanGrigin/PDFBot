@@ -63,6 +63,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✏️ Переименовать PDF", callback_data="menu_renamepdf")],
         [InlineKeyboardButton(text="✂️ Разделить PDF", callback_data="menu_splitpdf")],
         [InlineKeyboardButton(text="🔁 Заменить/вставить страницы", callback_data="menu_editpages")],
+        [InlineKeyboardButton(text="📐 Выровнять ширину страниц", callback_data="menu_alignpdf")],
+        [InlineKeyboardButton(text="🔲 Обрезать страницы", callback_data="menu_croppages")],
     ])
 
 def makepdf_controls_kb() -> InlineKeyboardMarkup:
@@ -105,6 +107,11 @@ class Flow(StatesGroup):
     editpages_wait_pdf = State()
     editpages_collect = State()
     editpages_ask_ops = State()
+
+    align_wait_pdf = State()
+
+    crop_wait_pdf = State()
+    crop_ask_ops = State()
 
 @dataclass
 class SessionData:
@@ -248,6 +255,137 @@ def _build_edited_pdf(raw: bytes, images: List[Image.Image], ops: List[Tuple[str
     return out.getvalue()
 
 
+def _suffixed_pdf_name(original_filename: str | None, suffix: str) -> str:
+    stem = _safe_pdf_name(original_filename or "document", "document")
+    return f"{stem}_{suffix}.pdf"
+
+
+def _align_pdf_widths(raw: bytes) -> Tuple[bytes, int, float]:
+    """Масштабировать все страницы к медианной ширине, сохраняя пропорции.
+
+    Возвращает (pdf_bytes, сколько страниц изменилось, медианная ширина).
+    Ширина учитывается визуальная: у страниц с /Rotate 90/270 она swaps с высотой.
+    """
+    reader = PdfReader(io.BytesIO(raw))
+    if not reader.pages:
+        raise ValueError("no pages")
+
+    def visual_width(page) -> float:
+        width, height = float(page.mediabox.width), float(page.mediabox.height)
+        rotation = int(page.get("/Rotate", 0) or 0)
+        return height if rotation % 180 else width
+
+    widths = sorted(visual_width(page) for page in reader.pages)
+    count = len(widths)
+    median = widths[count // 2] if count % 2 else (widths[count // 2 - 1] + widths[count // 2]) / 2
+
+    changed = 0
+    writer = PdfWriter()
+    for page in reader.pages:
+        width = visual_width(page)
+        if width > 0 and abs(width - median) > 0.1:
+            page.scale_by(median / width)
+            changed += 1
+        writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue(), changed, median
+
+
+_CROP_OP_RE = re.compile(r"^\s*(?P<pages>\d+\s*(?:-\s*\d+)?|все|all)\s*=\s*(?P<rest>.+?)\s*$", re.IGNORECASE)
+_CROP_NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+def _crop_ops_help(page_count: int) -> str:
+    return (
+        "Формат — по одной операции в строке:\n"
+        "• 2 = 10 0 10 0 — у страницы 2 отрезать 10% сверху, 0% снизу, 10% слева, 0% справа\n"
+        "• 1-5 = 15 15 0 0 — то же для страниц с 1 по 5\n"
+        "• все = 10 10 10 10 — то же для всех страниц\n\n"
+        "Четыре числа — проценты страницы: сверху, снизу, слева, справа. "
+        f"Страниц в PDF: {page_count}."
+    )
+
+def _parse_crop_ops(text: str, page_count: int) -> List[Tuple[int, int, float, float, float, float]]:
+    """Разобрать команды «страницы = верх низ лево право» (проценты на отрезание)."""
+    lines = [line for line in re.split(r"[\n;]+", text or "") if line.strip()]
+    if not lines:
+        raise ValueError("Не нашёл ни одной операции. Пример: все = 10 10 10 10.")
+
+    ops: List[Tuple[int, int, float, float, float, float]] = []
+    for line in lines:
+        match = _CROP_OP_RE.match(line)
+        if not match:
+            raise ValueError(
+                f"Не понял строку «{line.strip()}». Формат: страницы = верх низ лево право."
+            )
+        pages = match.group("pages").lower().replace(" ", "")
+        if pages in ("все", "all"):
+            start, end = 1, page_count
+        elif "-" in pages:
+            first, last = pages.split("-")
+            start, end = int(first), int(last)
+            if start > end:
+                start, end = end, start
+        else:
+            start = end = int(pages)
+        for page in (start, end):
+            if not 1 <= page <= page_count:
+                raise ValueError(f"Страницы {page} нет: в PDF страницы от 1 до {page_count}.")
+
+        rest = match.group("rest")
+        numbers = [float(value.replace(",", ".")) for value in _CROP_NUM_RE.findall(rest)]
+        leftover = _CROP_NUM_RE.sub(" ", rest)
+        if leftover.strip(" .,;"):
+            raise ValueError(
+                f"Не понял часть после «=» в строке «{line.strip()}». Нужно ровно 4 числа: "
+                "сверху, снизу, слева, справа (проценты)."
+            )
+        if len(numbers) != 4:
+            raise ValueError(
+                f"В строке «{line.strip()}» нужно 4 числа (сверху, снизу, слева, справа), "
+                f"а найдено {len(numbers)}."
+            )
+        top, bottom, left, right = numbers
+        if not all(0 <= value <= 95 for value in (top, bottom, left, right)):
+            raise ValueError("Поля задаются процентами от 0 до 95.")
+        if top + bottom >= 100 or left + right >= 100:
+            raise ValueError("Сумма полей сверху+снизу и слева+справа должна быть меньше 100%.")
+        ops.append((start, end, top, bottom, left, right))
+    return ops
+
+def _crop_pdf_pages(raw: bytes, ops: List[Tuple[int, int, float, float, float, float]]) -> Tuple[bytes, int]:
+    """Обрезать поля страниц по плану. Возвращает (pdf_bytes, сколько страниц обрезано)."""
+    reader = PdfReader(io.BytesIO(raw))
+    if not reader.pages:
+        raise ValueError("no pages")
+
+    plan: dict[int, Tuple[float, float, float, float]] = {}
+    for start, end, top, bottom, left, right in ops:
+        for index in range(start - 1, end):
+            plan[index] = (top, bottom, left, right)  # последняя строка по странице решает
+
+    writer = PdfWriter()
+    for index, page in enumerate(reader.pages):
+        if index in plan:
+            top, bottom, left, right = plan[index]
+            x0, y0 = float(page.mediabox.left), float(page.mediabox.bottom)
+            x1, y1 = float(page.mediabox.right), float(page.mediabox.top)
+            new_x0 = x0 + left / 100 * (x1 - x0)
+            new_y0 = y0 + bottom / 100 * (y1 - y0)
+            new_x1 = x1 - right / 100 * (x1 - x0)
+            new_y1 = y1 - top / 100 * (y1 - y0)
+            page.mediabox.lower_left = (new_x0, new_y0)
+            page.mediabox.upper_right = (new_x1, new_y1)
+            page.cropbox.lower_left = (new_x0, new_y0)
+            page.cropbox.upper_right = (new_x1, new_y1)
+        writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue(), len(plan)
+
+
 def _compress_pdf_file(source: str, target: str) -> None:
     """Сжать PDF через Ghostscript без shell и проверить созданный файл."""
     executable = shutil.which("gs")
@@ -319,7 +457,8 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "📄 <b>Best PDF Robot</b>\n\n"
         "Создавайте PDF из фотографий без обрезки, переименовывайте файлы, "
-        "сжимайте, разделяйте документы, заменяйте страницы фото или вставляйте новые страницы.\n\n"
+        "сжимайте, разделяйте документы, заменяйте страницы фото, выравнивайте "
+        "ширину страниц и обрезайте поля.\n\n"
         "• До 15 изображений в одном PDF\n"
         f"• Обработка PDF до {MAX_PDF_DOWNLOAD_MB} МБ\n"
         "• Временные файлы удаляются после отправки\n"
@@ -387,6 +526,30 @@ async def menu_editpages(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         "Пришлите PDF, в котором нужно заменить страницы новыми фото "
         "или вставить новые страницы между старыми.\n"
+        f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
+        reply_markup=cancel_kb()
+    )
+
+@router.callback_query(F.data == "menu_alignpdf")
+async def menu_alignpdf(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(Flow.align_wait_pdf)
+    await state.update_data(sess=_new_session().__dict__)
+    await call.message.answer(
+        "Пришлите PDF — все страницы будут масштабированы к медианной ширине "
+        "(пропорции каждой страницы сохранятся, ширина станет одинаковой).\n"
+        f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
+        reply_markup=cancel_kb()
+    )
+
+@router.callback_query(F.data == "menu_croppages")
+async def menu_croppages(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(Flow.crop_wait_pdf)
+    await state.update_data(sess=_new_session().__dict__)
+    await call.message.answer(
+        "Пришлите PDF — обрежу поля у выбранных страниц (содержимое останется, "
+        "страница станет меньше).\n"
         f"Ограничение: до {MAX_PDF_DOWNLOAD_MB} МБ.",
         reply_markup=cancel_kb()
     )
@@ -977,6 +1140,181 @@ async def editpages_receive_ops(message: Message, state: FSMContext, bot: Bot):
             pass
         await state.clear()
 
+# ====== ALIGN PAGE WIDTHS ======
+@router.message(Flow.align_wait_pdf, F.document)
+async def align_receive_pdf(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not name.endswith(".pdf"):
+        await message.answer("Это не PDF. Пришлите файл .pdf", reply_markup=cancel_kb())
+        return
+    if _pdf_too_large(doc.file_size):
+        await message.answer(
+            f"Файл слишком большой ({(doc.file_size or 0) / (1024*1024):.1f} МБ).\n"
+            f"Сейчас бот обрабатывает PDF до {MAX_PDF_DOWNLOAD_MB} МБ.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
+        return
+
+    await message.answer("⏳ Скачиваю PDF и выравниваю ширину страниц…")
+    try:
+        raw = await _download_telegram_file(bot, doc.file_id)
+        pdf_bytes, changed, median = await asyncio.to_thread(_align_pdf_widths, raw)
+    except Exception:
+        await message.answer(
+            "Не удалось обработать PDF. Возможно, файл повреждён или защищён паролем.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+
+    if changed == 0:
+        await _show_menu(
+            message,
+            f"Все страницы уже одной ширины ({median:.0f} pt) — выравнивать нечего."
+        )
+        await state.clear()
+        return
+
+    if len(pdf_bytes) > MAX_OUTPUT_BYTES:
+        await message.answer(
+            "Результат получился больше 49 МБ и не проходит по ограничениям Telegram.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        await message.answer_document(
+            FSInputFile(tmp_path, filename=_suffixed_pdf_name(doc.file_name, "aligned"))
+        )
+        await _show_menu(
+            message,
+            f"Готово: страниц выровнено {changed}, ширина всех страниц теперь {median:.0f} pt."
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        await state.clear()
+
+# ====== CROP PAGES ======
+@router.message(Flow.crop_wait_pdf, F.document)
+async def crop_receive_pdf(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not name.endswith(".pdf"):
+        await message.answer("Это не PDF. Пришлите файл .pdf", reply_markup=cancel_kb())
+        return
+    if _pdf_too_large(doc.file_size):
+        await message.answer(
+            f"Файл слишком большой ({(doc.file_size or 0) / (1024*1024):.1f} МБ).\n"
+            f"Сейчас бот обрабатывает PDF до {MAX_PDF_DOWNLOAD_MB} МБ.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+
+    await message.answer("Скачиваю PDF…")
+    try:
+        raw = await _download_telegram_file(bot, doc.file_id)
+    except Exception:
+        await message.answer(
+            "Не удалось скачать PDF (ошибка Telegram/сети). Попробуйте ещё раз.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+
+    try:
+        page_count = len(PdfReader(io.BytesIO(raw)).pages)
+    except Exception:
+        await message.answer(
+            "Не удалось прочитать PDF (возможно, файл повреждён или защищён паролем).",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+    if page_count <= 0:
+        await message.answer("В PDF нет страниц.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    sess = SessionData(**data["sess"])
+    sess.pdf_file_id = doc.file_id
+    sess.original_filename = doc.file_name
+    sess.page_count = page_count
+    await state.update_data(sess=sess.__dict__)
+
+    await state.set_state(Flow.crop_ask_ops)
+    await message.answer(
+        f"В PDF {page_count} страниц. Напишите, сколько отрезать у каждой группы страниц.\n\n"
+        f"{_crop_ops_help(page_count)}",
+        reply_markup=cancel_kb()
+    )
+
+@router.message(Flow.crop_ask_ops, F.text)
+async def crop_receive_ops(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    sess = SessionData(**data["sess"])
+    page_count = sess.page_count or 0
+
+    try:
+        ops = _parse_crop_ops(message.text or "", page_count)
+    except ValueError as error:
+        await message.answer(
+            f"⚠️ {error}\n\nПришлите операции ещё раз одним сообщением.\n\n"
+            f"{_crop_ops_help(page_count)}",
+            reply_markup=cancel_kb()
+        )
+        return
+
+    if not _enough_disk():
+        await message.answer("На сервере осталось меньше 5 ГБ. Новые файлы временно не принимаются.")
+        await state.clear()
+        return
+
+    await message.answer("⏳ Обрезаю страницы…")
+    try:
+        raw = await _download_telegram_file(bot, sess.pdf_file_id)
+        pdf_bytes, cropped = await asyncio.to_thread(_crop_pdf_pages, raw, ops)
+        if len(pdf_bytes) > MAX_OUTPUT_BYTES:
+            raise ValueError("result too large")
+    except Exception:
+        await message.answer(
+            "Не удалось обработать PDF. Возможно, файл повреждён или защищён паролем.",
+            reply_markup=main_menu_kb()
+        )
+        await state.clear()
+        return
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        await message.answer_document(
+            FSInputFile(tmp_path, filename=_suffixed_pdf_name(sess.original_filename, "cropped"))
+        )
+        await _show_menu(message, f"Готово: обрезано страниц {cropped} из {page_count}.")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        await state.clear()
+
 # ====== Fallbacks / nicer errors ======
 @router.message(Flow.makepdf_collect)
 async def makepdf_other(message: Message):
@@ -1018,16 +1356,32 @@ async def editpages_ops_other(message: Message):
         reply_markup=cancel_kb()
     )
 
+@router.message(Flow.align_wait_pdf)
+async def align_other(message: Message):
+    await message.answer("Жду PDF-документ.", reply_markup=cancel_kb())
+
+@router.message(Flow.crop_wait_pdf)
+async def crop_other(message: Message):
+    await message.answer("Жду PDF-документ.", reply_markup=cancel_kb())
+
+@router.message(Flow.crop_ask_ops)
+async def crop_ops_other(message: Message):
+    await message.answer(
+        "Жду текст с полями, например: все = 10 10 0 0 (проценты: сверху, снизу, слева, справа).",
+        reply_markup=cancel_kb()
+    )
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Заполните BOT_TOKEN в .env")
     bot = Bot(BOT_TOKEN)
     await bot.set_my_name("Best PDF Robot")
     await bot.set_my_short_description(
-        "Создание и сжатие PDF, переименование, разделение и замена/вставка страниц.")
+        "Создание и сжатие PDF, переименование, разделение, замена/вставка и обрезка страниц, "
+        "выравнивание ширины.")
     await bot.set_my_description(
         "Создаёт PDF из фотографий без обрезки, сжимает, переименовывает, разделяет документы, "
-        "заменяет страницы фото и вставляет новые страницы.")
+        "заменяет и вставляет страницы, выравнивает ширину страниц и обрезает поля.")
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть главное меню"),
         BotCommand(command="help", description="Показать возможности бота"),
